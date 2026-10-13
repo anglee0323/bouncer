@@ -120,7 +120,16 @@ class FilterSheetViewModel: ObservableObject {
     var filteredCount: Int { filteredCounts[selectedPlatform] ?? 0 }
     @Published var canGoBack = false
     @Published var canGoForward = false
-    @Published var currentURL: String = ""
+    @Published var currentURL: String = "" {
+        didSet {
+            // Reaching the authenticated home timeline is the cue to silently
+            // enable x.com push (once per install) — see PushAutoEnabler.
+            PushAutoEnabler.shared.onURLChanged(currentURL, coordinator: cache.coordinator)
+        }
+    }
+    // The settings sheet's "Push notifications" toggle. Mirrors user intent
+    // (PushRegistrar.notificationsOnKey) and the live subscription state.
+    @Published var notificationsEnabled: Bool = PushRegistrar.shared.isSubscribedToX && !PushRegistrar.userOptedOut
     @Published var isEditingURL = false
     @Published var isFilteredModalOpen = false
     // Scroll-driven nav bar visibility: WebCoordinator's contentOffset
@@ -374,6 +383,44 @@ class FilterSheetViewModel: ObservableObject {
 
     func reload() {
         webView?.reload()
+    }
+
+    // The settings-sheet "Push notifications" toggle. ON subscribes (via the
+    // same hidden-settings flow as the silent auto-enable); OFF drops the
+    // subscription — unlike Android, iOS can't suppress a push after Apple
+    // delivers it, so "off" has to mean "unsubscribed". x.com's next attempt
+    // gets a 410 from the push service and it stops sending.
+    func refreshNotificationsEnabled() {
+        notificationsEnabled = PushRegistrar.shared.isSubscribedToX && !PushRegistrar.userOptedOut
+    }
+
+    func setNotificationsEnabled(_ on: Bool) {
+        PushRegistrar.setNotificationsOn(on)
+        notificationsEnabled = on
+        if on {
+            PushAutoEnabler.shared.enableFromSettings(coordinator: cache.coordinator) { [weak self] ok in
+                if !ok { self?.notificationsEnabled = false }
+            }
+        } else {
+            Task { @MainActor in
+                _ = await PushRegistrar.shared.unsubscribe(scope: PushRegistrar.xScope)
+            }
+        }
+    }
+
+    // Notification tap (see FilteredWebViewContainer.openPushURL): show
+    // `platform`, then load `url` in its webview. A webview that still has
+    // to be built needs a beat first — selectPlatformAndNavigate defers
+    // construction ~400ms to let any push animation commit.
+    func openPushURL(_ url: URL, platform: String) {
+        let needsCreation = cache.webView(for: platform, create: false) == nil
+        if selectedPlatform != platform || needsCreation {
+            selectPlatformAndNavigate(platform)
+        }
+        Task { @MainActor [weak self] in
+            if needsCreation { try? await Task.sleep(nanoseconds: 900_000_000) }
+            self?.navigateTo(urlString: url.absoluteString)
+        }
     }
 
     func navigateTo(urlString: String) {
@@ -1358,6 +1405,24 @@ struct BouncerSettingsView: View {
                 }
             }
 
+            // Web Push for x.com, delivered natively (see WebPush/). The
+            // toggle reflects the live subscription; turning it on runs the
+            // same silent enable flow the app attempts after login.
+            Section {
+                Toggle(isOn: Binding(
+                    get: { viewModel.notificationsEnabled },
+                    set: { viewModel.setNotificationsEnabled($0) }
+                )) {
+                    Text("Push notifications from X")
+                }
+                .onAppear { viewModel.refreshNotificationsEnabled() }
+                .onReceive(NotificationCenter.default.publisher(for: PushAutoEnabler.stateChangedNotification)) { _ in
+                    viewModel.refreshNotificationsEnabled()
+                }
+            } footer: {
+                Text("Likes, replies, mentions and messages, as X would send them to a browser.")
+            }
+
             // Excluded accounts for the selected platform: posts from these
             // accounts are never classified or hidden. The list also grows
             // from the filtered-posts panel's "Never filter @x" button;
@@ -2311,6 +2376,19 @@ struct FilteredWebViewContainer: View {
         }
     }
 
+    // A tapped Bouncer notification wants the feed on `url`. Make sure the
+    // feed is pushed (a cold launch may still be sitting on the picker), then
+    // let the view model switch platform + navigate.
+    private func openPushURL(_ url: URL) {
+        let platform = Platforms.fromHost((url.host ?? "").lowercased())?.id ?? "twitter"
+        if navPath.isEmpty {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { navPath.append(platform) }
+        }
+        viewModel.openPushURL(url, platform: platform)
+    }
+
     var body: some View {
         ZStack {
             NavigationStack(path: $navPath) {
@@ -2339,6 +2417,15 @@ struct FilteredWebViewContainer: View {
             }
         }
         .onAppear(perform: restoreLastPlatformIfNeeded)
+        // Web Push taps. A warm app gets the notification directly; on a cold
+        // launch the tap arrives before this view exists, so PushRegistrar
+        // parks the URL and we collect it once mounted.
+        .onAppear {
+            if let url = PushRegistrar.shared.consumePendingOpenURL() { openPushURL(url) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: PushRegistrar.openURLNotification)) { note in
+            if let url = note.object as? URL { openPushURL(url) }
+        }
         .animation(.easeOut(duration: 0.35), value: isOnboarded)
         // If onboarding is re-triggered (DEBUG-only via the ladybug button),
         // pop the NavigationStack back to its root so the platform picker

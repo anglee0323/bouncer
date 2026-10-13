@@ -90,6 +90,10 @@ struct FilteredWebView: UIViewRepresentable {
             // iOS Local Inference: classify/detect bridges for the on-device Gemma model.
             contentController.add(coordinator, contentWorld: world, name: "feedfilterLocalClassify")
             contentController.add(coordinator, contentWorld: world, name: "feedfilterLocalAiTextDetect")
+            // Web Push: answers the page-world Push API polyfill (WebPushPolyfill.js)
+            // with native keys + the relay endpoint. Registered in the PAGE world
+            // because that's where x.com's own code calls pushManager.subscribe().
+            contentController.addScriptMessageHandler(coordinator, contentWorld: .page, name: WebPushBridge.handlerName)
 
             injectScripts(into: contentController)
 
@@ -105,11 +109,7 @@ struct FilteredWebView: UIViewRepresentable {
             webView.navigationDelegate = coordinator
             webView.uiDelegate = coordinator
             webView.allowsBackForwardNavigationGestures = true
-            if UIDevice.current.userInterfaceIdiom == .pad {
-                webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
-            } else {
-                webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
-            }
+            webView.customUserAgent = userAgent()
             if #available(iOS 16.4, *) {
                 webView.isInspectable = true
             }
@@ -134,6 +134,15 @@ struct FilteredWebView: UIViewRepresentable {
             return webView
         }
 
+        // The Safari UA x.com is served against. Shared with the hidden
+        // push-settings view (PushAutoEnabler) so it gets the same client.
+        static func userAgent() -> String {
+            if UIDevice.current.userInterfaceIdiom == .pad {
+                return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+            }
+            return "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+        }
+
         // MARK: - Script Injection
 
         private static func injectScripts(into controller: WKUserContentController) {
@@ -153,6 +162,16 @@ struct FilteredWebView: UIViewRepresentable {
                 controller.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true, in: .page))
                 print("[FeedFilter] Injected lockup-extractor.js (page world)")
             } else { print("[FeedFilter] lockup-extractor.js NOT bundled") }
+
+            // 0b. Web Push polyfill — page world, document start. Gives x.com
+            // the PushManager / Notification / serviceWorker shape it
+            // feature-detects and routes subscribe() to WebPushBridge. It
+            // self-gates to x.com / twitter.com hosts.
+            if let source = loadBundledScript(named: "WebPushPolyfill", ext: "js") {
+                controller.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true, in: .page))
+                let version = source.firstMatch(of: /BOUNCER_PUSH_POLYFILL_VERSION = (\d+)/).map { String($0.1) } ?? "?"
+                print("[FeedFilter] Injected WebPushPolyfill.js v\(version) (page world)")
+            } else { print("[FeedFilter] WebPushPolyfill.js NOT bundled") }
 
             // 1. ChromePolyfill.js — document start. Prepends two globals the
             // JS bundles read at load: the extension version, and the on-device
@@ -592,6 +611,15 @@ struct FilteredWebView: UIViewRepresentable {
             didReceive message: WKScriptMessage,
             replyHandler: @escaping (Any?, String?) -> Void
         ) {
+            if message.name == WebPushBridge.handlerName {
+                let body = message.body
+                Task { @MainActor in
+                    let (result, error) = await WebPushBridge.handle(body: body)
+                    replyHandler(result, error)
+                }
+                return
+            }
+
             guard message.name == "feedfilterStorage",
                   let body = message.body as? [String: Any],
                   let op = body["op"] as? String,
