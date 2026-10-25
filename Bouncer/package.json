@@ -34,7 +34,7 @@
     "esbuild": "^0.20.0",
     "eslint": "^10.0.2",
     "globals": "^17.4.0",
-    "happy-dom": "^20.8.1",
+    "happy-dom": "^21.0.4",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.57.0",
     "vitest": "^4.0.18"
